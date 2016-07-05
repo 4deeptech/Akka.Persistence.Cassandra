@@ -37,10 +37,10 @@ namespace Akka.Persistence.Cassandra
             SessionManager = CassandraSession.Instance.Apply(system);
             
             // Read config
-            var journalConfig = system.Settings.Config.GetConfig("cassandra-journal");
+            var journalConfig = system.Settings.Config.GetConfig("akka.persistence.journal.cassandra-journal");
             JournalSettings = new CassandraJournalSettings(journalConfig);
 
-            var snapshotConfig = system.Settings.Config.GetConfig("cassandra-snapshot-store");
+            var snapshotConfig = system.Settings.Config.GetConfig("akka.persistence.snapshot-store.cassandra-snapshot-store");
             SnapshotStoreSettings = new CassandraSnapshotStoreSettings(snapshotConfig);
         }
     }
