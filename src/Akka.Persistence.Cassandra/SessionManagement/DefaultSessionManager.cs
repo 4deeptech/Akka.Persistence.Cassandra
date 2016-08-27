@@ -20,7 +20,7 @@ namespace Akka.Persistence.Cassandra.SessionManagement
             if (system == null) throw new ArgumentNullException("system");
 
             // Read configuration sections
-            _sessionConfigs = system.Settings.Config.GetConfig("cassandra-sessions");
+            _sessionConfigs = system.Settings.Config.GetConfig("akka.persistence.cassandra-sessions");
 
             _sessionCache = new ConcurrentDictionary<string, Lazy<ISession>>();
         }
