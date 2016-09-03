@@ -70,11 +70,11 @@ namespace Akka.Persistence.Cassandra.Snapshot
             // Make deletes async as well, but make sure we still publish like the base class does
             if (message is DeleteSnapshot)
             {
-                HandleDeleteAsync((DeleteSnapshot) message, msg => DeleteAsync(msg.Metadata));
+                HandleDeleteAsync((DeleteSnapshot) message, msg => DeleteAsync(msg.Metadata)).Wait();
             }
             else if (message is DeleteSnapshots)
             {
-                HandleDeleteAsync((DeleteSnapshots) message, msg => DeleteAsync(msg.PersistenceId, msg.Criteria));
+                HandleDeleteAsync((DeleteSnapshots) message, msg => DeleteAsync(msg.PersistenceId, msg.Criteria)).Wait();
             }
             else
             {
