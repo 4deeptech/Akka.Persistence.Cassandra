@@ -5,10 +5,11 @@ namespace Akka.Persistence.Cassandra.Tests
 {
     public class CassandraSnapshotStoreSpec : SnapshotStoreSpec
     {
-        private static readonly Config SnapshotConfig = ConfigurationFactory.ParseString(@"
-            akka.persistence.snapshot-store.plugin = ""cassandra-snapshot-store""
-            akka.test.single-expect-default = 10s
-        ");
+        private static readonly Config SnapshotConfig = ConfigurationFactory.Load();
+        //private static readonly Config SnapshotConfig = ConfigurationFactory.ParseString(@"
+        //    akka.persistence.snapshot-store.plugin = ""cassandra-snapshot-store""
+        //    akka.test.single-expect-default = 10s
+        //");
 
         public CassandraSnapshotStoreSpec()
             : base(SnapshotConfig, "CassandraSnapshotSystem")

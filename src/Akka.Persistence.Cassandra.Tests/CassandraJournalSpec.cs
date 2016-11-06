@@ -5,10 +5,12 @@ namespace Akka.Persistence.Cassandra.Tests
 {
     public class CassandraJournalSpec : JournalSpec
     {
-        private static readonly Config JournalConfig = ConfigurationFactory.ParseString(@"
-            akka.persistence.journal.plugin = ""cassandra-journal""
-            akka.test.single-expect-default = 10s
-        ");
+        //private static readonly Config JournalConfig = ConfigurationFactory.ParseString(@"
+        //    akka.persistence.journal.plugin = ""cassandra-journal""
+        //    akka.test.single-expect-default = 10s
+        //");
+
+        private static readonly Config JournalConfig = ConfigurationFactory.Load();
 
         public CassandraJournalSpec()
             : base(JournalConfig, "CassandraJournalSystem")
@@ -22,5 +24,7 @@ namespace Akka.Persistence.Cassandra.Tests
             TestSetupHelpers.ResetJournalData(Sys);
             base.Dispose(disposing);
         }
+
+        protected override bool SupportsRejectingNonSerializableObjects { get { return false; } }
     }
 }

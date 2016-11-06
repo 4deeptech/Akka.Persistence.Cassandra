@@ -12,14 +12,15 @@ namespace Akka.Persistence.Cassandra.Tests
     /// </summary>
     public class CassandraIntegrationSpec : Akka.TestKit.Xunit2.TestKit
     {
-        private static readonly Config IntegrationConfig = ConfigurationFactory.ParseString(@"
-            akka.persistence.journal.plugin = ""cassandra-journal""
-            akka.persistence.snapshot-store.plugin = ""cassandra-snapshot-store""
-            akka.persistence.publish-plugin-commands = on
-            akka.test.single-expect-default = 10s
-            cassandra-journal.partition-size = 5
-            cassandra-journal.max-result-size = 3
-        ");
+        private static readonly Config IntegrationConfig = ConfigurationFactory.Load();
+        //private static readonly Config IntegrationConfig = ConfigurationFactory.ParseString(@"
+        //    akka.persistence.journal.plugin = ""cassandra-journal""
+        //    akka.persistence.snapshot-store.plugin = ""cassandra-snapshot-store""
+        //    akka.persistence.publish-plugin-commands = on
+        //    akka.test.single-expect-default = 10s
+        //    cassandra-journal.partition-size = 5
+        //    cassandra-journal.max-result-size = 3
+        //");
 
         // Static so that each test run gets a different Id number
         private static readonly AtomicCounter ActorIdCounter = new AtomicCounter();
@@ -59,7 +60,6 @@ namespace Akka.Persistence.Cassandra.Tests
 
         [Theory]
         [InlineData(true)]
-        [InlineData(false)]
         public void Cassandra_journal_should_not_replay_deleted_messages(bool permanentDelete)
         {
             // Listen for delete messages on the event stream
@@ -145,7 +145,7 @@ namespace Akka.Persistence.Cassandra.Tests
         {
             // Create an actor and trigger manual recovery so it will accept new messages
             var actor1 = Sys.ActorOf(Props.Create<PersistentActorCWithManualRecovery>(_actorId, TestActor));
-            actor1.Tell(new Recover(SnapshotSelectionCriteria.None));
+            actor1.Tell(new Recovery(SnapshotSelectionCriteria.None));
 
             // Write a message, snapshot, then write some follow-up messages
             actor1.Tell("a");
@@ -157,7 +157,7 @@ namespace Akka.Persistence.Cassandra.Tests
             // Create another copy of that actor and manually recover to an upper bound (i.e. past state) and verify
             // we get the expected messages after the snapshot
             var actor2 = Sys.ActorOf(Props.Create<PersistentActorCWithManualRecovery>(_actorId, TestActor));
-            actor2.Tell(new Recover(SnapshotSelectionCriteria.Latest, toSequenceNr: 3L));
+            actor2.Tell(new Recovery(SnapshotSelectionCriteria.Latest, toSequenceNr: 3L));
             ExpectMsg("offered-a-1");
             ExpectHandled("a", 2, true);
             ExpectHandled("a", 3, true);
@@ -302,7 +302,7 @@ namespace Akka.Persistence.Cassandra.Tests
                 if (message is DeleteToCommand)
                 {
                     var delete = (DeleteToCommand) message;
-                    DeleteMessages(delete.SequenceNumber, delete.Permanent);
+                    DeleteMessages(delete.SequenceNumber);
                     return true;
                 }
 
@@ -382,7 +382,7 @@ namespace Akka.Persistence.Cassandra.Tests
                 if (message is DeleteToCommand)
                 {
                     var delete = (DeleteToCommand) message;
-                    DeleteMessages(delete.SequenceNumber, delete.Permanent);
+                    DeleteMessages(delete.SequenceNumber);
                     return true;
                 }
                 

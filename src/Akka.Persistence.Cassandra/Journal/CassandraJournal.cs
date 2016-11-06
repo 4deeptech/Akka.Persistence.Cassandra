@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 using System.Threading.Tasks;
+using Akka.Actor;
 using Akka.Configuration;
 using Akka.Persistence.Journal;
 using Akka.Serialization;
@@ -42,7 +44,8 @@ namespace Akka.Persistence.Cassandra.Journal
 
             // Use setting from the persistence extension when batch deleting
             PersistenceExtension persistence = Context.System.PersistenceExtension();
-            _maxDeletionBatchSize = persistence.Settings.Journal.MaxDeletionBatchSize;
+            //_maxDeletionBatchSize = persistence.Settings..Journal.MaxDeletionBatchSize;
+            _maxDeletionBatchSize = 10;
         }
         
         protected override void PreStart()
@@ -90,60 +93,7 @@ namespace Akka.Persistence.Cassandra.Journal
             }
         }
 
-        public override async Task ReplayMessagesAsync(string persistenceId, long fromSequenceNr, long toSequenceNr, long max,
-                                                       Action<IPersistentRepresentation> replayCallback)
-        {
-            long partitionNumber = GetPartitionNumber(fromSequenceNr);
 
-            // A sequence number may have been moved to the next partition if it was part of a batch that was too large
-            // to write to a single partition
-            long maxPartitionNumber = GetPartitionNumber(toSequenceNr) + 1L;
-            long count = 0L;
-
-            while (partitionNumber <= maxPartitionNumber && count < max)
-            {
-                // Check for header and deleted to sequence number in parallel
-                RowSet[] rowSets = await GetHeaderAndDeletedTo(persistenceId, partitionNumber).ConfigureAwait(false);
-
-                // If header doesn't exist, just bail on the non-existent partition
-                if (rowSets[0].SingleOrDefault() == null)
-                    return;
-
-                // See what's been deleted in the partition and if no record found, just use long's min value
-                Row deletedToRow = rowSets[1].SingleOrDefault();
-                long deletedTo = deletedToRow == null ? long.MinValue : deletedToRow.GetValue<long>("sequence_number");
-
-                // Page through messages in the partition
-                bool hasNextPage = true;
-                byte[] pageState = null;
-                while (count < max && hasNextPage)
-                {
-                    // Get next page from current partition
-                    IStatement getRows = _selectMessages.Bind(persistenceId, partitionNumber, fromSequenceNr, toSequenceNr)
-                                                        .SetConsistencyLevel(_cassandraExtension.JournalSettings.ReadConsistency)
-                                                        .SetPageSize(_cassandraExtension.JournalSettings.MaxResultSize)
-                                                        .SetPagingState(pageState)
-                                                        .SetAutoPage(false);
-
-                    RowSet messageRows = await _session.ExecuteAsync(getRows).ConfigureAwait(false);
-                    pageState = messageRows.PagingState;
-                    hasNextPage = pageState != null;
-                    IEnumerator<IPersistentRepresentation> messagesEnumerator =
-                        messageRows.Select(row => MapRowToPersistentRepresentation(row, deletedTo))
-                                   .GetEnumerator();
-
-                    // Process page
-                    while (count < max && messagesEnumerator.MoveNext())
-                    {
-                        replayCallback(messagesEnumerator.Current);
-                        count++;
-                    }
-                }
-                
-                // Go to next partition
-                partitionNumber++;
-            }
-        }
 
         public override async Task<long> ReadHighestSequenceNrAsync(string persistenceId, long fromSequenceNr)
         {
@@ -182,132 +132,6 @@ namespace Akka.Persistence.Cassandra.Journal
             return maxSequenceNumber;
         }
 
-        protected override async Task WriteMessagesAsync(IEnumerable<IPersistentRepresentation> messages)
-        {
-            // It's implied by the API/docs that a batch of messages will be for a single persistence id
-            List<IPersistentRepresentation> messageList = messages.ToList();
-
-            if (!messageList.Any())
-                return;
-
-            string persistenceId = messageList[0].PersistenceId;
-
-            long seqNr = messageList[0].SequenceNr;
-            bool writeHeader = IsNewPartition(seqNr);
-            long partitionNumber = GetPartitionNumber(seqNr);
-
-            if (messageList.Count > 1)
-            {
-                // See if this collection of writes would span multiple partitions and if so, move all the writes to the next partition
-                long lastMessagePartition = GetPartitionNumber(messageList[messageList.Count - 1].SequenceNr);
-                if (lastMessagePartition != partitionNumber)
-                {
-                    partitionNumber = lastMessagePartition;
-                    writeHeader = true;
-                }
-            }
-
-            // No need for a batch if writing a single message
-            if (messageList.Count == 1 && writeHeader == false)
-            {
-                IPersistentRepresentation message = messageList[0];
-                IStatement statement = _writeMessage.Bind(persistenceId, partitionNumber, message.SequenceNr, Serialize(message))
-                                                    .SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
-                await _session.ExecuteAsync(statement);
-                return;
-            }
-
-            // Use a batch and add statements for each message
-            var batch = new BatchStatement();
-            foreach (IPersistentRepresentation message in messageList)
-            {
-                batch.Add(_writeMessage.Bind(message.PersistenceId, partitionNumber, message.SequenceNr, Serialize(message)));
-            }
-
-            // Add header if necessary
-            if (writeHeader)
-                batch.Add(_writeHeader.Bind(persistenceId, partitionNumber, seqNr));
-
-            batch.SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
-            await _session.ExecuteAsync(batch);
-        }
-
-        protected override async Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr, bool isPermanent)
-        {
-            long maxPartitionNumber = GetPartitionNumber(toSequenceNr) + 1L;
-            long partitionNumber = 0L;
-
-            while (partitionNumber <= maxPartitionNumber)
-            {
-                // Check for header and deleted to sequence number in parallel
-                RowSet[] rowSets = await GetHeaderAndDeletedTo(persistenceId, partitionNumber).ConfigureAwait(false);
-
-                // If header doesn't exist, just bail on the non-existent partition
-                Row headerRow = rowSets[0].SingleOrDefault();
-                if (headerRow == null)
-                    return;
-
-                // Start deleting either from the first sequence number after the last deletion, or the beginning of the partition
-                Row deletedToRow = rowSets[1].SingleOrDefault();
-                long deleteFrom = deletedToRow == null
-                                      ? headerRow.GetValue<long>("sequence_number")
-                                      : deletedToRow.GetValue<long>("sequence_number") + 1L;
-                
-                // Nothing to delete if we're going to start higher than the specified sequence number
-                if (deleteFrom > toSequenceNr)
-                    return;
-
-                // Get the last sequence number in the partition and try to avoid tombstones by skipping deletes
-                IStatement getLastMessageSequence = _selectLastMessageSequence.Bind(persistenceId, partitionNumber, deleteFrom)
-                                                                              .SetConsistencyLevel(_cassandraExtension.JournalSettings.ReadConsistency);
-                RowSet lastSequenceRows = await _session.ExecuteAsync(getLastMessageSequence).ConfigureAwait(false);
-                
-                // If we have a sequence number, we've got messages to delete still in the partition
-                Row lastSequenceRow = lastSequenceRows.SingleOrDefault();
-                if (lastSequenceRow != null)
-                {
-                    // Delete either to the end of the partition or to the number specified, whichever comes first
-                    long deleteTo = Math.Min(lastSequenceRow.GetValue<long>("sequence_number"), toSequenceNr);
-                    if (isPermanent == false)
-                    {
-                        IStatement writeMarker = _writeDeleteMarker.Bind(persistenceId, partitionNumber, deleteTo)
-                                                                   .SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
-                        await _session.ExecuteAsync(writeMarker).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        // Permanently delete using batches in parallel
-                        long batchFrom = deleteFrom;
-                        long batchTo;
-                        var batches = new List<Task>();
-                        do
-                        {
-                            batchTo = Math.Min(batchFrom + _maxDeletionBatchSize - 1L, deleteTo);
-
-                            var batch = new BatchStatement();
-                            for (long seq = batchFrom; seq <= batchTo; seq++)
-                                batch.Add(_deleteMessagePermanent.Bind(persistenceId, partitionNumber, seq));
-
-                            batch.Add(_writeDeleteMarker.Bind(persistenceId, partitionNumber, batchTo));
-                            batch.SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
-
-                            batches.Add(_session.ExecuteAsync(batch));
-                            batchFrom = batchTo + 1L;
-                        } while (batchTo < deleteTo);
-
-                        await Task.WhenAll(batches).ConfigureAwait(false);
-                    }
-                    
-                    // If we've deleted everything we're supposed to, no need to continue
-                    if (deleteTo == toSequenceNr)
-                        return;
-                }
-                
-                // Go to next partition
-                partitionNumber++;
-            }
-        }
-
         private Task<RowSet[]> GetHeaderAndDeletedTo(string persistenceId, long partitionNumber)
         {
             return Task.WhenAll(new[]
@@ -321,7 +145,7 @@ namespace Akka.Persistence.Cassandra.Journal
         {
             IPersistentRepresentation pr = Deserialize(row.GetValue<byte[]>("message"));
             if (pr.SequenceNr <= deletedTo)
-                pr = pr.Update(pr.SequenceNr, pr.PersistenceId, true, pr.Sender);
+                pr = pr.Update(pr.SequenceNr, pr.PersistenceId, true, pr.Sender, pr.WriterGuid);
 
             return pr;
         }
@@ -374,6 +198,245 @@ namespace Akka.Persistence.Cassandra.Journal
             {
                 _cassandraExtension.SessionManager.ReleaseSession(_session);
                 _session = null;
+            }
+        }
+
+        public override async Task ReplayMessagesAsync(IActorContext context, string persistenceId, long fromSequenceNr, long toSequenceNr, long max, Action<IPersistentRepresentation> recoveryCallback)
+        {
+            long partitionNumber = GetPartitionNumber(fromSequenceNr);
+
+            // A sequence number may have been moved to the next partition if it was part of a batch that was too large
+            // to write to a single partition
+            long maxPartitionNumber = GetPartitionNumber(toSequenceNr) + 1L;
+            long count = 0L;
+
+            while (partitionNumber <= maxPartitionNumber && count < max)
+            {
+                // Check for header and deleted to sequence number in parallel
+                RowSet[] rowSets = await GetHeaderAndDeletedTo(persistenceId, partitionNumber).ConfigureAwait(false);
+
+                // If header doesn't exist, just bail on the non-existent partition
+                if (rowSets[0].SingleOrDefault() == null)
+                    return;
+
+                // See what's been deleted in the partition and if no record found, just use long's min value
+                Row deletedToRow = rowSets[1].SingleOrDefault();
+                long deletedTo = deletedToRow == null ? long.MinValue : deletedToRow.GetValue<long>("sequence_number");
+
+                // Page through messages in the partition
+                bool hasNextPage = true;
+                byte[] pageState = null;
+                while (count < max && hasNextPage)
+                {
+                    // Get next page from current partition
+                    IStatement getRows = _selectMessages.Bind(persistenceId, partitionNumber, fromSequenceNr, toSequenceNr)
+                                                        .SetConsistencyLevel(_cassandraExtension.JournalSettings.ReadConsistency)
+                                                        .SetPageSize(_cassandraExtension.JournalSettings.MaxResultSize)
+                                                        .SetPagingState(pageState)
+                                                        .SetAutoPage(false);
+
+                    RowSet messageRows = await _session.ExecuteAsync(getRows).ConfigureAwait(false);
+                    pageState = messageRows.PagingState;
+                    hasNextPage = pageState != null;
+                    IEnumerator<IPersistentRepresentation> messagesEnumerator =
+                        messageRows.Select(row => MapRowToPersistentRepresentation(row, deletedTo))
+                                   .GetEnumerator();
+
+                    // Process page
+                    while (count < max && messagesEnumerator.MoveNext())
+                    {
+                        recoveryCallback(messagesEnumerator.Current);
+                        count++;
+                    }
+                }
+
+                // Go to next partition
+                partitionNumber++;
+            }
+        }
+
+        protected async override Task<IImmutableList<Exception>> WriteMessagesAsync(IEnumerable<AtomicWrite> messages)
+        {
+            //there was a change from persisence 1.0 to 1.1 where this can be a list of lists
+            foreach(AtomicWrite write in messages)
+            {
+
+                //if(write.Size == 1)
+                //{
+                //    var singlePayload = write.Payload as IImmutableList<IPersistentRepresentation>;
+                //    if (singlePayload != null && singlePayload.Count == 1)
+                //    {
+                //        string persistenceId = singlePayload[0].PersistenceId;
+
+                //        long seqNr = singlePayload[0].SequenceNr;
+                //        bool writeHeader = IsNewPartition(seqNr);
+                //        long partitionNumber = GetPartitionNumber(seqNr);
+
+                //        // No need for a batch if writing a single message
+                //        if (writeHeader == false)
+                //        {
+
+                //            IStatement statement = _writeMessage.Bind(persistenceId, partitionNumber, singlePayload[0].SequenceNr, Serialize(singlePayload[0]))
+                //                                                .SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
+                //            await _session.ExecuteAsync(statement);
+                //            return null;
+                //        }
+                //    }
+                //}
+                //else
+                //{
+                //    // It's implied by the API/docs that a batch of messages will be for a single persistence id
+                //    var payloads = write.Payload as IImmutableList<IPersistentRepresentation>;
+                //    List<IPersistentRepresentation> messageList = payloads.ToList();
+
+                //    if (!messageList.Any())
+                //        return null;
+
+                //    string persistenceId = messageList[0].PersistenceId;
+
+                //    long seqNr = messageList[0].SequenceNr;
+                //    bool writeHeader = IsNewPartition(seqNr);
+                //    long partitionNumber = GetPartitionNumber(seqNr);
+
+                //    if (messageList.Count > 1)
+                //    {
+                //        // See if this collection of writes would span multiple partitions and if so, move all the writes to the next partition
+                //        long lastMessagePartition = GetPartitionNumber(messageList[messageList.Count - 1].SequenceNr);
+                //        if (lastMessagePartition != partitionNumber)
+                //        {
+                //            partitionNumber = lastMessagePartition;
+                //            writeHeader = true;
+                //        }
+                //    }
+
+                //    // Use a batch and add statements for each message
+                //    var batch = new BatchStatement();
+                //    foreach (IPersistentRepresentation message in messageList)
+                //    {
+                //        batch.Add(_writeMessage.Bind(message.PersistenceId, partitionNumber, message.SequenceNr, Serialize(message)));
+                //    }
+
+                //    // Add header if necessary
+                //    if (writeHeader)
+                //        batch.Add(_writeHeader.Bind(persistenceId, partitionNumber, seqNr));
+
+                //    batch.SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
+                //    await _session.ExecuteAsync(batch);
+                //}
+                var payloads = write.Payload as IImmutableList<IPersistentRepresentation>;
+                List<IPersistentRepresentation> messageList = payloads.ToList();
+
+                if (!messageList.Any())
+                    return null;
+
+                string persistenceId = messageList[0].PersistenceId;
+
+                long seqNr = messageList[0].SequenceNr;
+                bool writeHeader = IsNewPartition(seqNr);
+                long partitionNumber = GetPartitionNumber(seqNr);
+
+                if (messageList.Count > 1)
+                {
+                    // See if this collection of writes would span multiple partitions and if so, move all the writes to the next partition
+                    long lastMessagePartition = GetPartitionNumber(messageList[messageList.Count - 1].SequenceNr);
+                    if (lastMessagePartition != partitionNumber)
+                    {
+                        partitionNumber = lastMessagePartition;
+                        writeHeader = true;
+                    }
+                }
+
+                // No need for a batch if writing a single message
+                if (messageList.Count == 1 && writeHeader == false)
+                {
+                    IPersistentRepresentation message = messageList[0];
+                    IStatement statement = _writeMessage.Bind(persistenceId, partitionNumber, message.SequenceNr, Serialize(message))
+                                                        .SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
+                    await _session.ExecuteAsync(statement);
+                    continue;
+                }
+
+                // Use a batch and add statements for each message
+                var batch = new BatchStatement();
+                foreach (IPersistentRepresentation message in messageList)
+                {
+                    batch.Add(_writeMessage.Bind(message.PersistenceId, partitionNumber, message.SequenceNr, Serialize(message)));
+                }
+
+                // Add header if necessary
+                if (writeHeader)
+                    batch.Add(_writeHeader.Bind(persistenceId, partitionNumber, seqNr));
+
+                batch.SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
+                await _session.ExecuteAsync(batch);
+            }
+            return null;
+        }
+
+        protected override async Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr)
+        {
+            long maxPartitionNumber = GetPartitionNumber(toSequenceNr) + 1L;
+            long partitionNumber = 0L;
+
+            while (partitionNumber <= maxPartitionNumber)
+            {
+                // Check for header and deleted to sequence number in parallel
+                RowSet[] rowSets = await GetHeaderAndDeletedTo(persistenceId, partitionNumber).ConfigureAwait(false);
+
+                // If header doesn't exist, just bail on the non-existent partition
+                Row headerRow = rowSets[0].SingleOrDefault();
+                if (headerRow == null)
+                    return;
+
+                // Start deleting either from the first sequence number after the last deletion, or the beginning of the partition
+                Row deletedToRow = rowSets[1].SingleOrDefault();
+                long deleteFrom = deletedToRow == null
+                                      ? headerRow.GetValue<long>("sequence_number")
+                                      : deletedToRow.GetValue<long>("sequence_number") + 1L;
+
+                // Nothing to delete if we're going to start higher than the specified sequence number
+                if (deleteFrom > toSequenceNr)
+                    return;
+
+                // Get the last sequence number in the partition and try to avoid tombstones by skipping deletes
+                IStatement getLastMessageSequence = _selectLastMessageSequence.Bind(persistenceId, partitionNumber, deleteFrom)
+                                                                              .SetConsistencyLevel(_cassandraExtension.JournalSettings.ReadConsistency);
+                RowSet lastSequenceRows = await _session.ExecuteAsync(getLastMessageSequence).ConfigureAwait(false);
+
+                // If we have a sequence number, we've got messages to delete still in the partition
+                Row lastSequenceRow = lastSequenceRows.SingleOrDefault();
+                if (lastSequenceRow != null)
+                {
+                    // Delete either to the end of the partition or to the number specified, whichever comes first
+                    long deleteTo = Math.Min(lastSequenceRow.GetValue<long>("sequence_number"), toSequenceNr);
+                    // Permanently delete using batches in parallel
+                    long batchFrom = deleteFrom;
+                    long batchTo;
+                    var batches = new List<Task>();
+                    do
+                    {
+                        batchTo = Math.Min(batchFrom + _maxDeletionBatchSize - 1L, deleteTo);
+
+                        var batch = new BatchStatement();
+                        for (long seq = batchFrom; seq <= batchTo; seq++)
+                            batch.Add(_deleteMessagePermanent.Bind(persistenceId, partitionNumber, seq));
+
+                        batch.Add(_writeDeleteMarker.Bind(persistenceId, partitionNumber, batchTo));
+                        batch.SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
+
+                        batches.Add(_session.ExecuteAsync(batch));
+                        batchFrom = batchTo + 1L;
+                    } while (batchTo < deleteTo);
+
+                    await Task.WhenAll(batches).ConfigureAwait(false);
+
+                    // If we've deleted everything we're supposed to, no need to continue
+                    if (deleteTo == toSequenceNr)
+                        return;
+                }
+
+                // Go to next partition
+                partitionNumber++;
             }
         }
     }
