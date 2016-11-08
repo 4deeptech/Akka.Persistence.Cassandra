@@ -260,69 +260,6 @@ namespace Akka.Persistence.Cassandra.Journal
             //there was a change from persisence 1.0 to 1.1 where this can be a list of lists
             foreach(AtomicWrite write in messages)
             {
-
-                //if(write.Size == 1)
-                //{
-                //    var singlePayload = write.Payload as IImmutableList<IPersistentRepresentation>;
-                //    if (singlePayload != null && singlePayload.Count == 1)
-                //    {
-                //        string persistenceId = singlePayload[0].PersistenceId;
-
-                //        long seqNr = singlePayload[0].SequenceNr;
-                //        bool writeHeader = IsNewPartition(seqNr);
-                //        long partitionNumber = GetPartitionNumber(seqNr);
-
-                //        // No need for a batch if writing a single message
-                //        if (writeHeader == false)
-                //        {
-
-                //            IStatement statement = _writeMessage.Bind(persistenceId, partitionNumber, singlePayload[0].SequenceNr, Serialize(singlePayload[0]))
-                //                                                .SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
-                //            await _session.ExecuteAsync(statement);
-                //            return null;
-                //        }
-                //    }
-                //}
-                //else
-                //{
-                //    // It's implied by the API/docs that a batch of messages will be for a single persistence id
-                //    var payloads = write.Payload as IImmutableList<IPersistentRepresentation>;
-                //    List<IPersistentRepresentation> messageList = payloads.ToList();
-
-                //    if (!messageList.Any())
-                //        return null;
-
-                //    string persistenceId = messageList[0].PersistenceId;
-
-                //    long seqNr = messageList[0].SequenceNr;
-                //    bool writeHeader = IsNewPartition(seqNr);
-                //    long partitionNumber = GetPartitionNumber(seqNr);
-
-                //    if (messageList.Count > 1)
-                //    {
-                //        // See if this collection of writes would span multiple partitions and if so, move all the writes to the next partition
-                //        long lastMessagePartition = GetPartitionNumber(messageList[messageList.Count - 1].SequenceNr);
-                //        if (lastMessagePartition != partitionNumber)
-                //        {
-                //            partitionNumber = lastMessagePartition;
-                //            writeHeader = true;
-                //        }
-                //    }
-
-                //    // Use a batch and add statements for each message
-                //    var batch = new BatchStatement();
-                //    foreach (IPersistentRepresentation message in messageList)
-                //    {
-                //        batch.Add(_writeMessage.Bind(message.PersistenceId, partitionNumber, message.SequenceNr, Serialize(message)));
-                //    }
-
-                //    // Add header if necessary
-                //    if (writeHeader)
-                //        batch.Add(_writeHeader.Bind(persistenceId, partitionNumber, seqNr));
-
-                //    batch.SetConsistencyLevel(_cassandraExtension.JournalSettings.WriteConsistency);
-                //    await _session.ExecuteAsync(batch);
-                //}
                 var payloads = write.Payload as IImmutableList<IPersistentRepresentation>;
                 List<IPersistentRepresentation> messageList = payloads.ToList();
 
